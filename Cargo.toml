@@ -1,0 +1,28 @@
+[package]
+name = "prosa-fetcher"
+version = "0.1.0"
+authors = ["Jeremy HERGAULT"]
+license = "LGPL-3.0-or-later"
+edition = "2024"
+description = "ProSA processor to fetch information from remote systems"
+
+[package.metadata.prosa.fetcher]
+proc = "proc::FetcherProc"
+settings = "proc::FetcherSettings"
+
+[dependencies]
+bytes = "1"
+prosa = "0.2"
+prosa-utils = "0.2"
+serde = "1"
+tokio = "1"
+thiserror = "2"
+tracing = "0.1"
+url = { version = "2", features = ["serde"] }
+base64 = "0.22"
+hmac = "0.12"
+
+hyper = { version = "1", features = ["full"] }
+http = "1"
+http-body-util = "0.1"
+hyper-util = { version = "0.1", features = ["full"] }
