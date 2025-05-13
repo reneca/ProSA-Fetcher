@@ -2,6 +2,7 @@
 name = "prosa-fetcher"
 version = "0.1.0"
 authors = ["Jeremy HERGAULT"]
+repository = "https://github.com/reneca/ProSA-Fetcher"
 license = "LGPL-3.0-or-later"
 edition = "2024"
 description = "ProSA processor to fetch information from remote systems"
