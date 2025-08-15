@@ -165,18 +165,16 @@ impl FetcherSettings {
         H: hmac::Mac + hmac::digest::KeyInit,
         M: Send,
     {
-        if let Some(target) = &self.target {
-            if let Some(password) = target.url.password() {
-                let binary_password = URL_SAFE.decode(password.replace("%3D", "="))?;
-                let mut mac = <H as hmac::digest::KeyInit>::new_from_slice(&binary_password)
-                    .map_err(|e| {
-                        FetcherError::Other(format!("Crypto error on password challenge {e}"))
-                    })?;
-                mac.update(challenge);
-                return Ok(Some(bytes::Bytes::copy_from_slice(
-                    &mac.finalize().into_bytes(),
-                )));
-            }
+        if let Some(password) = self.target.as_ref().and_then(|t| t.url.password()) {
+            let binary_password = URL_SAFE.decode(password.replace("%3D", "="))?;
+            let mut mac =
+                <H as hmac::digest::KeyInit>::new_from_slice(&binary_password).map_err(|e| {
+                    FetcherError::Other(format!("Crypto error on password challenge {e}"))
+                })?;
+            mac.update(challenge);
+            return Ok(Some(bytes::Bytes::copy_from_slice(
+                &mac.finalize().into_bytes(),
+            )));
         }
 
         Ok(None)
@@ -272,11 +270,8 @@ impl FetcherProc {
                                                     let _ = resp_tx.send(Ok(r)).await;
                                                 }
                                                 Err(e) => {
-                                                    if !e.is_closed() {
-                                                        let _ = resp_tx.send(Err(FetcherError::from(e))).await;
-                                                    } else {
-                                                        continue 'conn;
-                                                    }
+                                                    let _ = resp_tx.send(Err(FetcherError::from(e))).await;
+                                                    continue 'conn;
                                                 }
                                             }
                                         }
@@ -353,7 +348,7 @@ impl FetcherProc {
 }
 
 macro_rules! process_action {
-    ($self:ident, $action:ident, $adaptor:ident, $http_req_tx:ident, $msg_id:ident) => {
+    ($self:ident, $action:ident, $adaptor:ident, $http_req_tx:ident) => {
         match $action {
             FetchAction::Http => {
                 let request_builder = if let Some(target) = &$self.settings.target {
@@ -383,11 +378,10 @@ macro_rules! process_action {
             }
             FetchAction::Srv(service_name, msg) => {
                 debug!("Call Service({}) Fetch action", service_name);
-                if let Some(service) = $self.service.get_proc_service(&service_name, $msg_id) {
-                    let req_msg = RequestMsg::new($msg_id, service_name.clone(), msg, $self.proc.get_service_queue());
+                if let Some(service) = $self.service.get_proc_service(&service_name) {
+                    let req_msg = RequestMsg::new(service_name.clone(), msg, $self.proc.get_service_queue());
                     debug!(name: "fetcher_proc", target: "prosa_proc_fetcher::proc", parent: req_msg.get_span(), proc_name = $self.proc.name(), service = service_name, request = format!("{:?}", req_msg.get_data()));
                     service.proc_queue.send(InternalMsg::Request(req_msg)).await?;
-                    $msg_id += 1;
                 }
             },
             FetchAction::None => { /* No further action to do */ }
@@ -428,18 +422,15 @@ where
             );
         }
 
-        // Msg ID to send service messages
-        let mut msg_id = 0;
-
         loop {
             tokio::select! {
                 _interval = fetch_interval.tick() => {
                     let action = adaptor.fetch()?;
-                    process_action!(self, action, adaptor, http_req_tx, msg_id);
+                    process_action!(self, action, adaptor, http_req_tx);
                 },
                 Some(http_resp) = http_resp_rx.recv() => {
                     let action = adaptor.process_http_response(http_resp?).await?;
-                    process_action!(self, action, adaptor, http_req_tx, msg_id);
+                    process_action!(self, action, adaptor, http_req_tx);
                 }
                 Some(msg) = self.internal_rx_queue.recv() => {
                     match msg {
@@ -450,11 +441,11 @@ where
                         ),
                         InternalMsg::Response(msg) => {
                             let action = adaptor.process_service_response(msg)?;
-                            process_action!(self, action, adaptor, http_req_tx, msg_id);
+                            process_action!(self, action, adaptor, http_req_tx);
                         },
                         InternalMsg::Error(err) => {
                             let action = adaptor.process_service_error(err)?;
-                            process_action!(self, action, adaptor, http_req_tx, msg_id);
+                            process_action!(self, action, adaptor, http_req_tx);
                         },
                         InternalMsg::Command(_) => todo!(),
                         InternalMsg::Config => todo!(),
