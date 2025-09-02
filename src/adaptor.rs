@@ -7,6 +7,7 @@ use hyper::{
     body::{Bytes, Incoming},
 };
 use prosa::core::adaptor::Adaptor;
+use tracing::warn;
 
 use crate::proc::{FetchAction, FetcherError, FetcherProc};
 
@@ -40,9 +41,14 @@ where
     /// Process http response
     fn process_http_response(
         &mut self,
-        _response: Response<Incoming>,
+        response: Result<Response<Incoming>, FetcherError<M>>,
     ) -> impl std::future::Future<Output = Result<FetchAction<M>, FetcherError<M>>> + Send {
-        ready(Ok(FetchAction::None))
+        if let Err(e) = response {
+            warn!("Wrong HTTP response: {:?}", e);
+            ready(Err(e))
+        } else {
+            ready(Ok(FetchAction::None))
+        }
     }
 
     /// Process service response

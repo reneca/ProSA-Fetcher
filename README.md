@@ -30,3 +30,13 @@ fetcher:
     secs: 10
     nanos: 0
 ```
+
+If you want to exclude a time range, you can use the `active_time_range` option to only fetch during a specif hour time range.
+From the start to the end hour of the day.
+```yaml
+fetcher:
+  <...>
+  active_time_range:
+    start: "06:00:00"
+    end: "23:00:00"
+```

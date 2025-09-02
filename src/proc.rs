@@ -42,8 +42,8 @@ where
     #[error("IO error during the fetch `{0}`")]
     Io(#[from] io::Error),
     /// Hyper error
-    #[error("Hyper error during the fetch `{0}`")]
-    Hyper(#[from] hyper::Error),
+    #[error("Hyper error during the fetch `{0:?}` from `{1}`")]
+    Hyper(hyper::Error, String),
     /// HTTP error
     #[error("HTTP error on object parsing `{0}`")]
     Http(#[from] http::Error),
@@ -77,7 +77,7 @@ where
     fn recoverable(&self) -> bool {
         match self {
             FetcherError::Io(error) => error.recoverable(),
-            FetcherError::Hyper(_error) => true,
+            FetcherError::Hyper(_error, _addr) => true,
             FetcherError::Http(_error) => true,
             FetcherError::Queue(_send_error) => false,
             FetcherError::HttpQueue(_send_error) => false,
@@ -134,6 +134,8 @@ pub struct FetcherSettings {
     timeout: Duration,
     /// Hour time range when the fetcher execute
     pub(crate) active_time_range: Option<TimeRange>,
+    #[serde(default)]
+    title_case_headers: bool,
 }
 
 impl FetcherSettings {
@@ -211,6 +213,18 @@ impl FetcherSettings {
             true
         }
     }
+
+    /// Getter of an HTTP1 context
+    pub fn get_http1_ctx(&self) -> http1::Builder {
+        let mut http1_ctx = http1::Builder::new();
+
+        if self.title_case_headers {
+            // Set HTTP1 context for old HTTP server
+            http1_ctx.title_case_headers(true);
+        }
+
+        http1_ctx
+    }
 }
 
 #[proc_settings]
@@ -223,6 +237,7 @@ impl Default for FetcherSettings {
             period: Self::get_default_period(),
             timeout: Self::get_default_timeout(),
             active_time_range: None,
+            title_case_headers: false,
         }
     }
 }
@@ -257,18 +272,15 @@ pub struct FetcherProc {}
 #[proc]
 impl FetcherProc {
     fn spawn_http_fetch(
-        interval: Duration,
+        settings: &FetcherSettings,
         target: TargetSetting,
-        have_time_range: bool,
         mut req_rx: mpsc::Receiver<Request<BoxBody<Bytes, Infallible>>>,
         resp_tx: mpsc::Sender<Result<Response<Incoming>, FetcherError<M>>>,
     ) {
+        let interval = settings.period;
+        let have_time_range = settings.active_time_range.is_some();
+        let http1_ctx = settings.get_http1_ctx();
         tokio::spawn(async move {
-            // Set HTTP1 context for old HTTP server
-            // FIXME set it as an option ?
-            let mut http1_ctx = http1::Builder::new();
-            http1_ctx.title_case_headers(true);
-
             let mut msg_to_send;
             'conn: loop {
                 // Wait for a message before openning the socket
@@ -305,8 +317,7 @@ impl FetcherProc {
                                                     let _ = resp_tx.send(Ok(r)).await;
                                                 }
                                                 Err(e) => {
-                                                    warn!(addr = target.to_string(), "Can't send H2 request: {}", e);
-                                                    let _ = resp_tx.send(Err(FetcherError::from(e))).await;
+                                                    let _ = resp_tx.send(Err(FetcherError::Hyper(e, target.to_string()))).await;
                                                     continue 'conn;
                                                 }
                                             }
@@ -340,8 +351,7 @@ impl FetcherProc {
                                                     let _ = resp_tx.send(Ok(r)).await;
                                                 }
                                                 Err(e) => {
-                                                    warn!(addr = target.to_string(), "Can't send HTTP request: {}", e);
-                                                    let _ = resp_tx.send(Err(FetcherError::from(e))).await;
+                                                    let _ = resp_tx.send(Err(FetcherError::Hyper(e, target.to_string()))).await;
                                                     continue 'conn;
                                                 }
                                             }
@@ -371,9 +381,15 @@ impl FetcherProc {
                     Err(e) => {
                         // If the distant have a time range, maybe the distant is not up, so just throw an info log
                         if have_time_range {
-                            info!(addr = target.to_string(), "Can't connect to remote: {}", e);
+                            info!(
+                                addr = target.to_string(),
+                                "Can't connect to remote: {:?}", e
+                            );
                         } else {
-                            warn!(addr = target.to_string(), "Can't connect to remote: {}", e);
+                            warn!(
+                                addr = target.to_string(),
+                                "Can't connect to remote: {:?}", e
+                            );
                         }
 
                         // Wait before retry
@@ -452,13 +468,7 @@ where
         let (http_req_tx, http_req_rx) = mpsc::channel(1);
         let (http_resp_tx, mut http_resp_rx) = mpsc::channel(1);
         if let Some(target) = &self.settings.target {
-            Self::spawn_http_fetch(
-                self.settings.period,
-                target.clone(),
-                self.settings.active_time_range.is_some(),
-                http_req_rx,
-                http_resp_tx,
-            );
+            Self::spawn_http_fetch(&self.settings, target.clone(), http_req_rx, http_resp_tx);
         }
 
         let mut is_active = true;
@@ -473,7 +483,7 @@ where
                     adaptor.end_active_period();
                 },
                 Some(http_resp) = http_resp_rx.recv() => {
-                    let action = adaptor.process_http_response(http_resp?).await?;
+                    let action = adaptor.process_http_response(http_resp).await?;
                     process_action!(self, action, adaptor, http_req_tx);
                 }
                 Some(msg) = self.internal_rx_queue.recv() => {
