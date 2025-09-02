@@ -1,6 +1,6 @@
 [package]
 name = "prosa-fetcher"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["Jeremy HERGAULT"]
 repository = "https://github.com/reneca/ProSA-Fetcher"
 license = "LGPL-3.0-or-later"
@@ -20,6 +20,7 @@ tokio = "1"
 thiserror = "2"
 tracing = "0.1"
 url = { version = "2", features = ["serde"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 base64 = "0.22"
 hmac = "0.12"
 

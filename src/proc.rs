@@ -4,6 +4,7 @@ use base64::{
     DecodeError, Engine as _,
     engine::general_purpose::{STANDARD, URL_SAFE},
 };
+use chrono::{Local, NaiveTime};
 use http::Response;
 use http_body_util::combinators::BoxBody;
 use hyper::{
@@ -27,7 +28,7 @@ use tokio::{
     sync::{mpsc, watch},
     time::{self, sleep},
 };
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::adaptor::FetcherAdaptor;
 
@@ -95,6 +96,25 @@ pub enum AuthMethod {
     Basic,
 }
 
+#[derive(Debug, Deserialize, Serialize, Copy, Clone)]
+pub struct TimeRange {
+    /// Start period hour
+    pub start: NaiveTime,
+    /// End period hour
+    pub end: NaiveTime,
+}
+
+impl TimeRange {
+    // Méthode pour vérifier si une heure donnée est dans la plage
+    pub fn contains(&self, time: &NaiveTime) -> bool {
+        if self.start <= self.end {
+            time >= &self.start && time <= &self.end
+        } else {
+            time >= &self.start || time <= &self.end
+        }
+    }
+}
+
 /// Settings for Fetcher processor
 #[proc_settings]
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -112,6 +132,8 @@ pub struct FetcherSettings {
     /// Timeout duration for every fetch
     #[serde(default = "FetcherSettings::get_default_timeout")]
     timeout: Duration,
+    /// Hour time range when the fetcher execute
+    pub(crate) active_time_range: Option<TimeRange>,
 }
 
 impl FetcherSettings {
@@ -179,6 +201,16 @@ impl FetcherSettings {
 
         Ok(None)
     }
+
+    /// Method to know if the fetcher is active depending of the time of the day.
+    /// It only return false if an `active_time_range` is set and the current time is not in range
+    pub fn is_active(&self) -> bool {
+        if let Some(active_time_range) = self.active_time_range {
+            active_time_range.contains(&Local::now().time())
+        } else {
+            true
+        }
+    }
 }
 
 #[proc_settings]
@@ -190,6 +222,7 @@ impl Default for FetcherSettings {
             auth_method: AuthMethod::default(),
             period: Self::get_default_period(),
             timeout: Self::get_default_timeout(),
+            active_time_range: None,
         }
     }
 }
@@ -226,6 +259,7 @@ impl FetcherProc {
     fn spawn_http_fetch(
         interval: Duration,
         target: TargetSetting,
+        have_time_range: bool,
         mut req_rx: mpsc::Receiver<Request<BoxBody<Bytes, Infallible>>>,
         resp_tx: mpsc::Sender<Result<Response<Incoming>, FetcherError<M>>>,
     ) {
@@ -261,6 +295,7 @@ impl FetcherProc {
                                     tokio::select! {
                                         // Closed the socket
                                         Err(_) = &mut connection => {
+                                            debug!(addr = target.to_string(), "Remote close the socket");
                                             continue 'conn;
                                         }
                                         // Send an HTTP request
@@ -270,6 +305,7 @@ impl FetcherProc {
                                                     let _ = resp_tx.send(Ok(r)).await;
                                                 }
                                                 Err(e) => {
+                                                    warn!(addr = target.to_string(), "Can't send H2 request: {}", e);
                                                     let _ = resp_tx.send(Err(FetcherError::from(e))).await;
                                                     continue 'conn;
                                                 }
@@ -294,6 +330,7 @@ impl FetcherProc {
                                     tokio::select! {
                                         // Closed the socket
                                         Err(_) = &mut connection => {
+                                            debug!(addr = target.to_string(), "Remote close the socket");
                                             continue 'conn;
                                         }
                                         // Send an HTTP request
@@ -303,13 +340,9 @@ impl FetcherProc {
                                                     let _ = resp_tx.send(Ok(r)).await;
                                                 }
                                                 Err(e) => {
-                                                    if e.is_closed() {
-                                                        continue 'conn;
-                                                    } else if e.is_canceled() {
-                                                        continue;
-                                                    } else {
-                                                        let _ = resp_tx.send(Err(FetcherError::from(e))).await;
-                                                    }
+                                                    warn!(addr = target.to_string(), "Can't send HTTP request: {}", e);
+                                                    let _ = resp_tx.send(Err(FetcherError::from(e))).await;
+                                                    continue 'conn;
                                                 }
                                             }
                                         }
@@ -336,7 +369,12 @@ impl FetcherProc {
                         }
                     }
                     Err(e) => {
-                        warn!("Can't connect to remote: {}", e);
+                        // If the distant have a time range, maybe the distant is not up, so just throw an info log
+                        if have_time_range {
+                            info!(addr = target.to_string(), "Can't connect to remote: {}", e);
+                        } else {
+                            warn!(addr = target.to_string(), "Can't connect to remote: {}", e);
+                        }
 
                         // Wait before retry
                         sleep(interval).await;
@@ -373,7 +411,7 @@ macro_rules! process_action {
                     Request::builder()
                 };
                 let request = $adaptor.create_http_request(request_builder)?;
-                debug!("Send: {:?}", request);
+                debug!(addr = $self.settings.target.as_ref().map(|t| t.to_string()), "Send: {:?}", request);
                 $http_req_tx.send(request).await.map_err(FetcherError::<M>::from)?;
             }
             FetchAction::Srv(service_name, msg) => {
@@ -417,16 +455,22 @@ where
             Self::spawn_http_fetch(
                 self.settings.period,
                 target.clone(),
+                self.settings.active_time_range.is_some(),
                 http_req_rx,
                 http_resp_tx,
             );
         }
 
+        let mut is_active = true;
         loop {
             tokio::select! {
-                _interval = fetch_interval.tick() => {
+                _interval = fetch_interval.tick() => if self.settings.is_active() {
+                    is_active = true;
                     let action = adaptor.fetch()?;
                     process_action!(self, action, adaptor, http_req_tx);
+                } else if is_active {
+                    is_active = false;
+                    adaptor.end_active_period();
                 },
                 Some(http_resp) = http_resp_rx.recv() => {
                     let action = adaptor.process_http_response(http_resp?).await?;

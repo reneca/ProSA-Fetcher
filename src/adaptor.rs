@@ -60,4 +60,8 @@ where
     ) -> Result<FetchAction<M>, FetcherError<M>> {
         Ok(FetchAction::None)
     }
+
+    /// Method called when active period has ended
+    /// If a time range is not configured, this method is never call
+    fn end_active_period(&mut self) {}
 }
