@@ -473,10 +473,7 @@ impl<A> Proc<A> for FetcherProc
 where
     A: Adaptor + FetcherAdaptor<M> + std::marker::Send,
 {
-    async fn internal_run(
-        &mut self,
-        _name: String,
-    ) -> Result<(), Box<dyn ProcError + Send + Sync>> {
+    async fn internal_run(&mut self) -> Result<(), Box<dyn ProcError + Send + Sync>> {
         // Initiate an adaptor for the fetcher processor
         let mut adaptor = A::new(self)?;
 

@@ -21,11 +21,12 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: stable
           components: clippy,rustc-dev
       - run: >
           cargo clippy --color always --verbose
@@ -35,6 +36,7 @@ jobs:
   fmt:
     name: Rust fmt
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -46,7 +48,7 @@ jobs:
   doc:
     name: Documentation
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     env:
       RUSTDOCFLAGS: -Dwarnings
     steps:
@@ -55,30 +57,45 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt
-      - run: cargo doc --color=always --verbose --no-deps
+      - run: cargo doc --all-features --color=always --verbose --workspace --no-deps
 
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
           components: rustc-dev
-      - run: cargo check --benches --all-features --release
+      - run: cargo check --workspace --tests --all-features --release
 
-  test:
-    name: Tests
+  doc_test:
+    name: Doc tests
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: llvm-tools, rustc-dev
       - run: >
-          cargo test --all-features --release
-          --tests --verbose --color always
+          cargo test --doc
+          --verbose --color always
+          --workspace --no-fail-fast
+
+  test:
+    name: Tests
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools, rustc-dev
+      - run: >
+          cargo test --release --tests
+          --verbose --color always
           --workspace --no-fail-fast
