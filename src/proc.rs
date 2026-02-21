@@ -1,9 +1,10 @@
-use std::{convert::Infallible, io, time::Duration};
-
-use base64::{
-    DecodeError, Engine as _,
-    engine::general_purpose::{STANDARD, URL_SAFE},
+use std::{
+    convert::Infallible,
+    io,
+    time::{Duration, Instant},
 };
+
+use base64::{DecodeError, Engine as _, engine::general_purpose::URL_SAFE};
 use chrono::{Local, NaiveTime};
 use http::Response;
 use http_body_util::combinators::BoxBody;
@@ -13,6 +14,7 @@ use hyper::{
     client::conn::{http1, http2},
 };
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use opentelemetry::KeyValue;
 use prosa::{
     core::{
         adaptor::Adaptor,
@@ -87,15 +89,6 @@ where
     }
 }
 
-#[derive(Debug, Default, Deserialize, Serialize, Copy, Clone)]
-pub enum AuthMethod {
-    /// Don't use the credential in URL to auth. Let the adaptor do the authentication..
-    None,
-    #[default]
-    /// Basic authentication method with credential provided from URL
-    Basic,
-}
-
 #[derive(Debug, Deserialize, Serialize, Copy, Clone)]
 pub struct TimeRange {
     /// Start period hour
@@ -123,9 +116,9 @@ pub struct FetcherSettings {
     target: Option<TargetSetting>,
     /// Remote service to call in order to fetch information from remote system
     service_name: Option<String>,
-    /// Authentication method use when a user:password is provide in the URL to authenticate to the remote
-    #[serde(default)]
-    pub auth_method: AuthMethod,
+    /// Authentication with authorization header with provided user password
+    #[serde(default = "FetcherSettings::get_default_authorization")]
+    pub authorization: bool,
     /// Period where the remote system need to be fetch
     #[serde(default = "FetcherSettings::get_default_period")]
     period: Duration,
@@ -139,6 +132,10 @@ pub struct FetcherSettings {
 }
 
 impl FetcherSettings {
+    fn get_default_authorization() -> bool {
+        true
+    }
+
     fn get_default_period() -> Duration {
         Duration::from_secs(60)
     }
@@ -151,14 +148,14 @@ impl FetcherSettings {
     pub fn new(
         target: TargetSetting,
         service_name: String,
-        auth_method: AuthMethod,
+        authorization: bool,
         period: Duration,
         timeout: Duration,
     ) -> FetcherSettings {
         FetcherSettings {
             target: Some(target),
             service_name: Some(service_name),
-            auth_method,
+            authorization,
             period,
             timeout,
             ..Default::default()
@@ -233,7 +230,7 @@ impl Default for FetcherSettings {
         FetcherSettings {
             target: None,
             service_name: None,
-            auth_method: AuthMethod::default(),
+            authorization: Self::get_default_authorization(),
             period: Self::get_default_period(),
             timeout: Self::get_default_timeout(),
             active_time_range: None,
@@ -434,15 +431,10 @@ macro_rules! process_action {
                     let _ = authority_url.set_username("");
                     let _ = authority_url.set_password(None);
                     let mut request_builder = Request::builder().header(hyper::header::HOST, authority_url.authority());
-                    match $self.settings.auth_method {
-                        AuthMethod::Basic => {
-                            if let (user, Some(password)) = (target.url.username(), target.url.password()) {
-                                if !user.is_empty() {
-                                    request_builder = request_builder.header(hyper::header::AUTHORIZATION, format!("Basic {}", STANDARD.encode(format!("{}:{}", user, password))));
-                                }
-                            }
-                        },
-                        _ => {},
+                    if $self.settings.authorization
+                        && let Some(authorization) = target.get_authentication()
+                    {
+                        request_builder = request_builder.header(hyper::header::AUTHORIZATION, authorization);
                     }
 
                     // TOOD add USER agent
@@ -492,20 +484,41 @@ where
             Self::spawn_http_fetch(&self.settings, target.clone(), http_req_rx, http_resp_tx);
         }
 
+        let meter = self.proc.meter("fetcher");
+        let action_histogram = meter
+            .u64_histogram("prosa_fetcher_duration")
+            .with_description("Fetcher duration histogram")
+            .build();
+
         let mut is_active = true;
+        let mut sent_time = Instant::now();
         loop {
             tokio::select! {
                 _interval = fetch_interval.tick() => if self.settings.is_active() {
                     is_active = true;
                     let action = adaptor.fetch()?;
                     process_action!(self, action, adaptor, http_req_tx);
+                    sent_time = Instant::now();
                 } else if is_active {
                     is_active = false;
                     adaptor.end_active_period();
                 },
                 Some(http_resp) = http_resp_rx.recv() => {
+                    let mut histogram_attributes = vec![
+                        KeyValue::new("type", "http"),
+                        KeyValue::new("code", http_resp.as_ref().map(|r| r.status().as_u16()).unwrap_or(502) as i64),
+                    ];
+                    if let Some(target) = &self.settings.target {
+                        histogram_attributes.push(KeyValue::new("target", target.to_string()));
+                    }
+                    action_histogram.record(
+                        sent_time.elapsed().as_millis() as u64,
+                        &histogram_attributes,
+                    );
+
                     let action = adaptor.process_http_response(http_resp).await?;
                     process_action!(self, action, adaptor, http_req_tx);
+                    sent_time = Instant::now();
                 }
                 Some(msg) = self.internal_rx_queue.recv() => {
                     match msg {
@@ -515,12 +528,30 @@ where
                             msg
                         ),
                         InternalMsg::Response(msg) => {
+                            action_histogram.record(
+                                sent_time.elapsed().as_millis() as u64,
+                                &[
+                                    KeyValue::new("type", "service"),
+                                    KeyValue::new("service", msg.get_service().clone()),
+                                    KeyValue::new("code", 0),
+                                ],
+                            );
                             let action = adaptor.process_service_response(msg)?;
                             process_action!(self, action, adaptor, http_req_tx);
+                            sent_time = Instant::now();
                         },
                         InternalMsg::Error(err) => {
+                            action_histogram.record(
+                                sent_time.elapsed().as_millis() as u64,
+                                &[
+                                    KeyValue::new("type", "service"),
+                                    KeyValue::new("service", err.get_service().clone()),
+                                    KeyValue::new("code", err.get_err().get_code() as i64),
+                                ],
+                            );
                             let action = adaptor.process_service_error(err)?;
                             process_action!(self, action, adaptor, http_req_tx);
+                            sent_time = Instant::now();
                         },
                         InternalMsg::Command(_) => todo!(),
                         InternalMsg::Config => todo!(),

@@ -14,7 +14,6 @@ settings = "proc::FetcherSettings"
 [dependencies]
 bytes = "1"
 prosa = "0.4"
-prosa-utils = "0.4"
 serde = "1"
 tokio = "1"
 thiserror = "2"
@@ -23,6 +22,8 @@ url = { version = "2", features = ["serde"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 base64 = "0.22"
 hmac = "0.12"
+
+opentelemetry = { version = "0.31", features = ["metrics"] }
 
 hyper = { version = "1", features = ["full"] }
 http = "1"
