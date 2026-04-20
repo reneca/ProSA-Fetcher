@@ -30,7 +30,7 @@ use tokio::{
     sync::{mpsc, watch},
     time,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::adaptor::FetcherAdaptor;
 
@@ -125,6 +125,9 @@ pub struct FetcherSettings {
     /// Timeout duration for every fetch
     #[serde(default = "FetcherSettings::get_default_timeout")]
     timeout: Duration,
+    /// Maximum number of retry to fetch a resource
+    #[serde(default = "FetcherSettings::get_default_max_retry")]
+    max_retry: u8,
     /// Hour time range when the fetcher execute
     pub(crate) active_time_range: Option<TimeRange>,
     #[serde(default)]
@@ -142,6 +145,10 @@ impl FetcherSettings {
 
     fn get_default_timeout() -> Duration {
         Duration::from_secs(10)
+    }
+
+    fn get_default_max_retry() -> u8 {
+        2
     }
 
     /// Create a new Fetcher settings
@@ -233,6 +240,7 @@ impl Default for FetcherSettings {
             authorization: Self::get_default_authorization(),
             period: Self::get_default_period(),
             timeout: Self::get_default_timeout(),
+            max_retry: Self::get_default_max_retry(),
             active_time_range: None,
             title_case_headers: false,
         }
@@ -277,21 +285,25 @@ impl FetcherProc {
         let timeout = settings.timeout;
         let have_time_range = settings.active_time_range.is_some();
         let http1_ctx = settings.get_http1_ctx();
+        let max_retry = settings.max_retry;
         tokio::spawn(async move {
-            let mut msg_to_send;
+            let mut msg_to_send = None;
+            let mut nb_retry = 0;
             'conn: loop {
                 // Wait for a message before openning the socket
-                msg_to_send = req_rx.recv().await;
                 if msg_to_send.is_none() {
-                    if let Err(e) = resp_tx.try_send(Err(FetcherError::Other(
-                        "Internal HTTP queue is closed".to_string(),
-                    ))) {
-                        warn!(
-                            addr = target.to_string(),
-                            "Error during message openning: {e}"
-                        );
+                    msg_to_send = req_rx.recv().await;
+                    if msg_to_send.is_none() {
+                        if let Err(e) = resp_tx.try_send(Err(FetcherError::Other(
+                            "Internal HTTP queue is closed".to_string(),
+                        ))) {
+                            warn!(
+                                addr = target.to_string(),
+                                "Error during message openning: {e}"
+                            );
+                        }
+                        return;
                     }
-                    return;
                 }
 
                 match target.connect().await {
@@ -307,32 +319,52 @@ impl FetcherProc {
                             .await
                             {
                                 Ok(Ok((mut sender, mut connection))) => loop {
-                                    tokio::select! {
-                                        // Closed the socket
-                                        Err(_) = &mut connection => {
-                                            debug!(addr = target.to_string(), "Remote close the socket");
-                                            continue 'conn;
-                                        }
-                                        // Send an HTTP request
-                                        resp = sender.send_request(msg_to_send.take().unwrap()), if msg_to_send.is_some() => {
-                                            match resp {
-                                                Ok(r) => {
-                                                    if let Err(e) = resp_tx.try_send(Ok(r)) {
-                                                        warn!(addr = target.to_string(), "Error during HTTP2 response return: {e}");
+                                    if let Some(msg) = msg_to_send.take() {
+                                        tokio::select! {
+                                            // Closed the socket
+                                            Err(_) = &mut connection => {
+                                                debug!(addr = target.to_string(), "Remote close the HTTP2 socket");
+                                                continue 'conn;
+                                            }
+                                            // Send an HTTP request
+                                            resp = sender.try_send_request(msg) => {
+                                                match resp {
+                                                    Ok(r) => {
+                                                        if let Err(e) = resp_tx.try_send(Ok(r)) {
+                                                            warn!(addr = target.to_string(), "Error during HTTP2 response return: {e}");
+                                                        } else {
+                                                            nb_retry = 0;
+                                                        }
                                                     }
-                                                }
-                                                Err(e) => {
-                                                    if let Err(e) = resp_tx.try_send(Err(FetcherError::Hyper(e, target.to_string()))) {
-                                                        warn!(addr = target.to_string(), "Error during HTTP2 error response return: {e}");
+                                                    Err(mut e) => {
+                                                        msg_to_send = e.take_message();
+                                                        let hyper_err = e.into_error();
+                                                        if nb_retry < max_retry {
+                                                            // try to send again the message after reconnection
+                                                            nb_retry += 1;
+                                                            continue 'conn;
+                                                        } else {
+                                                            error!(addr = target.to_string(), "Failed to fetch HTTP2 `{msg_to_send:?}`, because of `{hyper_err}`, after {nb_retry}/{max_retry} retries");
+                                                            if let Err(e) = resp_tx.try_send(Err(FetcherError::Hyper(hyper_err, target.to_string()))) {
+                                                                warn!(addr = target.to_string(), "Error during HTTP2 error response return: {e}");
+                                                            }
+                                                            continue 'conn;
+                                                        }
                                                     }
-                                                    continue 'conn;
                                                 }
                                             }
                                         }
-                                        // Receive a message to send from the queue
-                                        Some(mut msg) = req_rx.recv() => {
-                                            *msg.version_mut() = http::Version::HTTP_2;
-                                            msg_to_send = Some(msg);
+                                    } else {
+                                        tokio::select! {
+                                            // Closed the socket
+                                            Err(_) = &mut connection => {
+                                                continue 'conn;
+                                            }
+                                            // Receive a message to send from the queue
+                                            Some(mut msg) = req_rx.recv() => {
+                                                *msg.version_mut() = http::Version::HTTP_2;
+                                                msg_to_send = Some(msg);
+                                            }
                                         }
                                     }
                                 },
@@ -352,29 +384,35 @@ impl FetcherProc {
                                         tokio::select! {
                                             // Closed the socket
                                             Err(_) = &mut connection => {
-                                                debug!(addr = target.to_string(), "Remote close the socket");
+                                                debug!(addr = target.to_string(), "Remote close the HTTP1 socket");
                                                 continue 'conn;
                                             }
                                             // Send an HTTP request
-                                            resp = sender.send_request(msg) => {
+                                            resp = sender.try_send_request(msg) => {
                                                 match resp {
                                                     Ok(r) => {
                                                         if let Err(e) = resp_tx.try_send(Ok(r)) {
-                                                            warn!(addr = target.to_string(), "Error during HTTP response return: {e}");
+                                                            warn!(addr = target.to_string(), "Error during HTTP1 response return: {e}");
+                                                        } else {
+                                                            nb_retry = 0;
                                                         }
                                                     }
-                                                    Err(e) => {
-                                                        if let Err(e) = resp_tx.try_send(Err(FetcherError::Hyper(e, target.to_string()))) {
-                                                            warn!(addr = target.to_string(), "Error during HTTP error response return: {e}");
+                                                    Err(mut e) => {
+                                                        msg_to_send = e.take_message();
+                                                        let hyper_err = e.into_error();
+                                                        if nb_retry < max_retry {
+                                                            // try to send again the message after reconnection
+                                                            nb_retry += 1;
+                                                            continue 'conn;
+                                                        } else {
+                                                            error!(addr = target.to_string(), "Failed to fetch HTTP1 `{msg_to_send:?}`, because of `{hyper_err}`, after {nb_retry}/{max_retry} retries");
+                                                            if let Err(e) = resp_tx.try_send(Err(FetcherError::Hyper(hyper_err, target.to_string()))) {
+                                                                warn!(addr = target.to_string(), "Error during HTTP1 error response return: {e}");
+                                                            }
+                                                            continue 'conn;
                                                         }
-                                                        continue 'conn;
                                                     }
                                                 }
-                                            }
-                                            // Receive a message to send from the queue
-                                            Some(mut msg) = req_rx.recv() => {
-                                                *msg.version_mut() = http::Version::HTTP_11;
-                                                msg_to_send = Some(msg);
                                             }
                                         }
                                     } else {
@@ -393,11 +431,11 @@ impl FetcherProc {
                                 },
                                 Ok(Err(handshake_error)) => warn!(
                                     addr = target.to_string(),
-                                    "HTTP handshake error: {handshake_error}"
+                                    "HTTP1 handshake error: {handshake_error}"
                                 ),
                                 Err(_) => warn!(
                                     addr = target.to_string(),
-                                    "HTTP handshake timeout after {}ms", target.connect_timeout
+                                    "HTTP1 handshake timeout after {}ms", target.connect_timeout
                                 ),
                             }
                         }
