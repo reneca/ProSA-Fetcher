@@ -353,6 +353,11 @@ impl FetcherProc {
                                                     }
                                                 }
                                             }
+                                            // Receive a message to send from the queue (unload also the queue if too many messages arrive)
+                                            Some(mut msg) = req_rx.recv() => {
+                                                *msg.version_mut() = http::Version::HTTP_2;
+                                                msg_to_send = Some(msg);
+                                            }
                                         }
                                     } else {
                                         tokio::select! {
@@ -413,6 +418,11 @@ impl FetcherProc {
                                                         }
                                                     }
                                                 }
+                                            }
+                                            // Receive a message to send from the queue (unload also the queue if too many messages arrive)
+                                            Some(mut msg) = req_rx.recv() => {
+                                                *msg.version_mut() = http::Version::HTTP_11;
+                                                msg_to_send = Some(msg);
                                             }
                                         }
                                     } else {
