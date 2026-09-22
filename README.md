@@ -8,7 +8,7 @@ The main goal of this processor is to retrieve metrics periodically from remote 
 
 For configuration, you can set either the `target`, or the `service_name` (or both), depending on your fetcher type.
 
-The `target` uses ProSA's [`TargetSetting`](https://docs.rs/prosa/latest/prosa/io/stream/struct.TargetSetting.html) to define all connection information.
+The `target` uses ProSA's [`TargetSetting`](https://docs.rs/prosa/latest/prosa/io/stream/struct.TargetSetting.html) to define all connection information. HTTP adaptors create HTTP requests; TCP adaptors create a byte request and read the response stream until their protocol's end marker.
 If you need to authenticate, you will have to set the user and password in the [url](https://docs.rs/url/latest/url/struct.Url.html#method.password).
 
 If you want to fetch an internal service, you only have to specify its name with `service_name`.
@@ -16,7 +16,7 @@ If you want to fetch an internal service, you only have to specify its name with
 An `auth_method` can also be set (not present in the following example), but generally, the auth method is known by the adaptor and will be set by it.
 
 The last two parameters, `period` and `timeout`, configure the interval between fetches and the timeout for each fetch, respectively.
-The timeout should be less than the period to ensure that only one fetch runs at a time.
+The timeout should be less than the period. If a fetch runs past the next tick, the fetcher coalesces overlapping ticks and starts at most one follow-up fetch.
 
 ```yaml
 fetcher:

@@ -7,6 +7,7 @@ use hyper::{
     body::{Bytes, Incoming},
 };
 use prosa::core::adaptor::Adaptor;
+use prosa::io::stream::{Stream, TargetSetting};
 use tracing::warn;
 
 use crate::proc::{FetchAction, FetcherError, FetcherProc};
@@ -35,8 +36,19 @@ where
     /// Create an HTTP request to fetch information
     fn create_http_request(
         &self,
-        request_builder: http::request::Builder,
-    ) -> Result<Request<BoxBody<Bytes, Infallible>>, FetcherError<M>>;
+        _request_builder: http::request::Builder,
+    ) -> Result<Request<BoxBody<Bytes, Infallible>>, FetcherError<M>> {
+        Err(FetcherError::Other(
+            "HTTP is unsupported by this adaptor".into(),
+        ))
+    }
+
+    /// Create a TCP request for the configured target.
+    fn create_tcp_request(&self, _target: &TargetSetting) -> Result<Bytes, FetcherError<M>> {
+        Err(FetcherError::Other(
+            "TCP is unsupported by this adaptor".into(),
+        ))
+    }
 
     /// Process http response
     fn process_http_response(
@@ -49,6 +61,15 @@ where
         } else {
             ready(Ok(FetchAction::None))
         }
+    }
+
+    /// Process a TCP stream after the request has been written.
+    fn process_tcp_response(
+        &mut self,
+        _target: &TargetSetting,
+        response: Result<Stream, FetcherError<M>>,
+    ) -> impl std::future::Future<Output = Result<FetchAction<M>, FetcherError<M>>> + Send {
+        ready(response.map(|_| FetchAction::None))
     }
 
     /// Process service response
