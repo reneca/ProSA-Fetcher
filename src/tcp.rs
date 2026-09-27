@@ -1,9 +1,11 @@
 use std::{io, marker::PhantomData, time::Duration};
 
 use bytes::Bytes;
-use prosa::io::stream::{Stream, TargetSetting};
+use prosa::{
+    io::stream::{Stream, TargetSetting},
+    tracing::warn,
+};
 use tokio::{io::AsyncWriteExt as _, sync::mpsc, time};
-use tracing::warn;
 
 use crate::proc::FetcherError;
 
@@ -80,6 +82,7 @@ pub(super) fn spawn<M: Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use prosa_utils::msg::simple_string_tvf::SimpleStringTvf;
     use tokio::net::TcpListener;
     use url::Url;
