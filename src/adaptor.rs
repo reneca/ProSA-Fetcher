@@ -6,9 +6,8 @@ use hyper::{
     Response,
     body::{Bytes, Incoming},
 };
-use prosa::core::adaptor::Adaptor;
 use prosa::io::stream::{Stream, TargetSetting};
-use tracing::warn;
+use prosa::{core::adaptor::Adaptor, tracing::warn};
 
 use crate::proc::{FetchAction, FetcherError, FetcherProc};
 

@@ -3,9 +3,11 @@ use std::{io, marker::PhantomData, time::Duration};
 use http::Response;
 use hyper::{body::Incoming, client::conn::http2};
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use prosa::io::stream::TargetSetting;
+use prosa::{
+    io::stream::TargetSetting,
+    tracing::{debug, error, warn},
+};
 use tokio::{sync::mpsc, time};
-use tracing::{debug, error, warn};
 
 use crate::proc::{
     AbortOnDropJoinHandle, FetcherError, FetcherSettings, HttpFetchResult, PendingHttpRequest,

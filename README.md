@@ -40,3 +40,25 @@ fetcher:
     start: "06:00:00"
     end: "23:00:00"
 ```
+
+## Fetch failures and metrics
+
+A failed fetch does not stop the processor. The worker applies `timeout` and
+`max_retry` to the current request, reports the final failure, and the
+processor tries again on the next scheduled tick. Internal processor and
+worker-channel failures remain fatal.
+
+The fetcher exports two metrics:
+
+- `prosa_fetcher_status_code` is a gauge containing the latest
+  HTTP-compatible result code. HTTP responses keep their exact status. Other
+  transports use `200` for success, `400` for invalid input, `401` for invalid
+  credentials, `403` for permission failures, `502` for protocol or broken
+  connection failures, `503` for unavailable targets or services, `504` for
+  timeouts, and `500` for other adaptor failures.
+- `prosa_fetcher_duration` records successful fetch durations in milliseconds.
+  Failed attempts are not added to this histogram and it has no success/error
+  result attribute.
+
+Outside `active_time_range`, no request is made and the status gauge retains
+its last observed value.
