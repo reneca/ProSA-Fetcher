@@ -41,6 +41,41 @@ fetcher:
     end: "23:00:00"
 ```
 
+## MQTT sessions
+
+With the `mqtt` cargo feature, an adaptor can return `FetchAction::Mqtt(session)` to open an MQTT 3.1.1 client session that receives pushed messages.
+The session gives the broker `target` (`mqtts://` or any ProSA SSL scheme for TLS), the client id, the credentials and the subscriptions.
+It uses a clean session, renews the subscriptions on every reconnection, and runs alongside the periodic fetches.
+A new session replaces the current one. The session closes when the processor stops or when the active time range ends.
+
+Messages go to `FetcherAdaptor::process_mqtt_message`, and connection changes go to `FetcherAdaptor::process_mqtt_event`:
+
+- `Connected` once the broker acknowledges the subscriptions.
+- `Disconnected` when the connection fails or is lost. The session reconnects with an exponential backoff.
+- `Refused` when the broker rejects the credentials, the client id or the protocol. The session stops, and the adaptor can return a new session, for example after refreshing its credentials over HTTP.
+
+Both callbacks return a `FetchAction`. HTTP and TCP actions follow the same one-request-in-flight rule as the periodic fetches.
+
+```yaml
+fetcher:
+  <...>
+  mqtt:
+    keep_alive:
+      secs: 60
+      nanos: 0
+    max_packet_size: 65536
+    reconnect_min:
+      secs: 1
+      nanos: 0
+    reconnect_max:
+      secs: 60
+      nanos: 0
+```
+
+All `mqtt` settings are optional and default to the values above. A packet larger than `max_packet_size` closes the connection.
+`timeout` bounds the CONNACK and SUBACK waits and every write. `reconnect_min` must be greater than zero.
+On a configuration reload, a change of the `mqtt` settings reconnects the current session. A `timeout` change applies from the next session.
+
 ## Fetch failures and metrics
 
 A failed fetch does not stop the processor. The worker applies `timeout` and
@@ -59,6 +94,12 @@ The fetcher exports two metrics:
 - `prosa_fetcher_duration` records successful fetch durations in milliseconds.
   Failed attempts are not added to this histogram and it has no success/error
   result attribute.
+
+With the `mqtt` feature, the fetcher also exports:
+
+- `prosa_fetcher_mqtt_connected`, a gauge set to `1` while the MQTT session
+  is connected and `0` otherwise.
+- `prosa_fetcher_mqtt_messages`, a counter of the MQTT messages received.
 
 Outside `active_time_range`, no request is made and the status gauge retains
 its last observed value.

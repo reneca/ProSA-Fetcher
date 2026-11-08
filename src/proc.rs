@@ -55,6 +55,10 @@ where
     /// Base64 decode error
     #[error("Can't decode Base64 data `{0}`")]
     B64Decode(#[from] DecodeError),
+    /// MQTT protocol error
+    #[cfg(feature = "mqtt")]
+    #[error("MQTT error `{0}`")]
+    Mqtt(#[from] crate::mqtt::MqttError),
     /// Other error
     #[error("Fetcher other error `{0}`")]
     Other(String),
@@ -81,6 +85,8 @@ where
             FetcherError::Queue(_send_error) => false,
             FetcherError::HttpQueue(_send_error) => false,
             FetcherError::B64Decode(_decode_error) => false,
+            #[cfg(feature = "mqtt")]
+            FetcherError::Mqtt(_error) => true,
             FetcherError::Other(_) => false,
         }
     }
@@ -122,6 +128,8 @@ where
                 StatusCode::INTERNAL_SERVER_ERROR.as_u16()
             }
             FetcherError::B64Decode(_) => StatusCode::UNAUTHORIZED.as_u16(),
+            #[cfg(feature = "mqtt")]
+            FetcherError::Mqtt(_) => StatusCode::BAD_GATEWAY.as_u16(),
         }
     }
 }
@@ -169,6 +177,10 @@ pub struct FetcherSettings {
     pub(crate) active_time_range: Option<TimeRange>,
     #[serde(default)]
     title_case_headers: bool,
+    /// MQTT session settings
+    #[cfg(feature = "mqtt")]
+    #[serde(default)]
+    pub mqtt: crate::mqtt::MqttSettings,
 }
 
 impl FetcherSettings {
@@ -280,6 +292,8 @@ impl Default for FetcherSettings {
             max_retry: Self::get_default_max_retry(),
             active_time_range: None,
             title_case_headers: false,
+            #[cfg(feature = "mqtt")]
+            mqtt: Default::default(),
         }
     }
 }
@@ -298,6 +312,10 @@ where
     Tcp,
     /// Send a service request message
     Srv(String, M),
+    /// Open an MQTT session, replacing the current one.
+    /// The session runs alongside the HTTP/TCP requests until the processor stops, the active period ends, or another session replaces it.
+    #[cfg(feature = "mqtt")]
+    Mqtt(Box<crate::mqtt::MqttSession>),
 }
 
 impl<M> FetchAction<M>
@@ -350,11 +368,15 @@ struct FetchFailure {
     error: String,
 }
 
-struct DispatchState<'a, M> {
+struct DispatchState<'a, M: Send> {
     network_request_pending: &'a mut bool,
     deferred_http_action: &'a mut bool,
     deferred_tcp_action: &'a mut bool,
     pending_service_action: &'a mut Option<(String, M)>,
+    #[cfg(feature = "mqtt")]
+    mqtt_worker: &'a mut Option<crate::mqtt::MqttWorker<M>>,
+    #[cfg(feature = "mqtt")]
+    mqtt_connected_gauge: &'a Gauge<u64>,
 }
 
 impl FetchFailure {
@@ -521,6 +543,15 @@ impl FetcherProc {
         if settings.period.is_zero() {
             warn!(
                 "Can't reload settings for processor {}: fetcher period must be greater than zero",
+                self.name()
+            );
+            return None;
+        }
+
+        #[cfg(feature = "mqtt")]
+        if settings.mqtt.reconnect_min.is_zero() {
+            warn!(
+                "Can't reload settings for processor {}: MQTT reconnect_min must be greater than zero",
                 self.name()
             );
             return None;
@@ -860,10 +891,61 @@ impl FetcherProc {
                     )));
                 }
             }
+            #[cfg(feature = "mqtt")]
+            FetchAction::Mqtt(session) => {
+                if let Some(worker) = state.mqtt_worker.take() {
+                    self.close_mqtt_worker(worker, state.mqtt_connected_gauge)
+                        .await;
+                }
+                info!(
+                    processor = self.name(),
+                    broker = %session.target,
+                    client_id = session.client_id,
+                    "Open MQTT session"
+                );
+                *state.mqtt_worker = Some(crate::mqtt::MqttWorker::spawn(
+                    *session,
+                    &self.settings.mqtt,
+                    self.settings.timeout,
+                ));
+            }
             FetchAction::None => {}
         }
 
         Ok(None)
+    }
+
+    #[cfg(feature = "mqtt")]
+    async fn next_mqtt_event(
+        worker: &mut Option<crate::mqtt::MqttWorker<M>>,
+    ) -> Option<crate::mqtt::WorkerEvent<M>> {
+        match worker {
+            Some(worker) => worker.events_rx.recv().await,
+            None => std::future::pending().await,
+        }
+    }
+
+    #[cfg(not(feature = "mqtt"))]
+    async fn next_mqtt_event(_worker: &mut ()) -> Infallible {
+        std::future::pending().await
+    }
+
+    #[cfg(feature = "mqtt")]
+    async fn close_mqtt_worker(
+        &self,
+        worker: crate::mqtt::MqttWorker<M>,
+        mqtt_connected_gauge: &Gauge<u64>,
+    ) {
+        mqtt_connected_gauge.record(0, &self.mqtt_metric_attributes(worker.session()));
+        worker.close(self.settings.timeout).await;
+    }
+
+    #[cfg(feature = "mqtt")]
+    fn mqtt_metric_attributes(&self, session: &crate::mqtt::MqttSession) -> [KeyValue; 2] {
+        [
+            KeyValue::new("processor", self.name().to_string()),
+            KeyValue::new("target", session.target.to_string()),
+        ]
     }
 
     fn spawn_http_fetch(
@@ -886,6 +968,12 @@ where
         if self.settings.period.is_zero() {
             return Err(Box::new(FetcherError::<M>::Other(
                 "Fetcher period must be greater than zero".to_string(),
+            )));
+        }
+        #[cfg(feature = "mqtt")]
+        if self.settings.mqtt.reconnect_min.is_zero() {
+            return Err(Box::new(FetcherError::<M>::Other(
+                "Fetcher MQTT reconnect_min must be greater than zero".to_string(),
             )));
         }
 
@@ -915,6 +1003,16 @@ where
             .u64_gauge("prosa_fetcher_status_code")
             .with_description("HTTP-compatible status code of the latest fetch result")
             .build();
+        #[cfg(feature = "mqtt")]
+        let mqtt_connected_gauge = meter
+            .u64_gauge("prosa_fetcher_mqtt_connected")
+            .with_description("1 when the MQTT session is connected, 0 otherwise")
+            .build();
+        #[cfg(feature = "mqtt")]
+        let mqtt_message_counter = meter
+            .u64_counter("prosa_fetcher_mqtt_messages")
+            .with_description("Number of MQTT messages received")
+            .build();
 
         let mut is_active = true;
         let mut last_status_code = None;
@@ -924,6 +1022,10 @@ where
         let mut deferred_tick = false;
         let mut pending_config: Option<std::sync::Arc<ProsaConfig>> = None;
         let mut pending_service_action = None;
+        #[cfg(feature = "mqtt")]
+        let mut mqtt_worker: Option<crate::mqtt::MqttWorker<M>> = None;
+        #[cfg(not(feature = "mqtt"))]
+        let mut mqtt_worker = ();
 
         macro_rules! record_failure {
             ($failure:expr) => {{
@@ -951,6 +1053,10 @@ where
                             deferred_http_action: &mut deferred_http_action,
                             deferred_tcp_action: &mut deferred_tcp_action,
                             pending_service_action: &mut pending_service_action,
+                            #[cfg(feature = "mqtt")]
+                            mqtt_worker: &mut mqtt_worker,
+                            #[cfg(feature = "mqtt")]
+                            mqtt_connected_gauge: &mqtt_connected_gauge,
                         },
                     )
                     .await?
@@ -959,6 +1065,32 @@ where
                     true
                 } else {
                     false
+                }
+            }};
+        }
+
+        macro_rules! apply_settings {
+            ($settings:expr) => {{
+                let settings = $settings;
+                #[cfg(feature = "mqtt")]
+                let mqtt_settings_changed = self.settings.mqtt != settings.mqtt;
+                self.apply_settings(
+                    settings,
+                    &mut fetch_interval,
+                    &mut http_req_tx,
+                    &mut http_resp_rx,
+                    &mut http_task,
+                    &mut tcp_worker,
+                );
+                #[cfg(feature = "mqtt")]
+                if mqtt_settings_changed && let Some(worker) = mqtt_worker.take() {
+                    let session = worker.session().clone();
+                    self.close_mqtt_worker(worker, &mqtt_connected_gauge).await;
+                    mqtt_worker = Some(crate::mqtt::MqttWorker::spawn(
+                        session,
+                        &self.settings.mqtt,
+                        self.settings.timeout,
+                    ));
                 }
             }};
         }
@@ -985,7 +1117,49 @@ where
                     }
                 } else if is_active {
                     is_active = false;
+                    #[cfg(feature = "mqtt")]
+                    if let Some(worker) = mqtt_worker.take() {
+                        self.close_mqtt_worker(worker, &mqtt_connected_gauge).await;
+                    }
                     adaptor.end_active_period();
+                },
+                mqtt_event = Self::next_mqtt_event(&mut mqtt_worker) => {
+                    #[cfg(not(feature = "mqtt"))]
+                    match mqtt_event {}
+                    #[cfg(feature = "mqtt")]
+                    {
+                        let Some(event) = mqtt_event else {
+                            mqtt_worker = None;
+                            continue;
+                        };
+                        let Some(worker) = mqtt_worker.as_ref() else {
+                            continue;
+                        };
+                        let attributes = self.mqtt_metric_attributes(worker.session());
+                        let (stage, action) = match event {
+                            crate::mqtt::WorkerEvent::Message { topic, payload } => {
+                                mqtt_message_counter.add(1, &attributes);
+                                ("process_mqtt_message", adaptor.process_mqtt_message(&topic, payload))
+                            }
+                            crate::mqtt::WorkerEvent::State(event) => {
+                                let connected = matches!(event, crate::mqtt::MqttEvent::Connected { .. });
+                                mqtt_connected_gauge.record(u64::from(connected), &attributes);
+                                ("process_mqtt_event", adaptor.process_mqtt_event(event))
+                            }
+                        };
+                        match action {
+                            Ok(action) => {
+                                let _ = dispatch_action!(action);
+                            }
+                            Err(error) => warn!(
+                                processor = self.name(),
+                                stage,
+                                status_code = error.status_code(),
+                                %error,
+                                "MQTT processing failed"
+                            ),
+                        }
+                    }
                 },
                 Some(http_result) = http_resp_rx.recv() => {
                     if !network_request_pending {
@@ -1065,14 +1239,7 @@ where
                         && let Some(settings) = self.reload_settings(config.as_ref(), &adaptor)
                     {
                         target_changed = self.settings.target != settings.target;
-                        self.apply_settings(
-                            settings,
-                            &mut fetch_interval,
-                            &mut http_req_tx,
-                            &mut http_resp_rx,
-                            &mut http_task,
-                            &mut tcp_worker,
-                        );
+                        apply_settings!(settings);
                     }
                     if let Some(failure) = control_failure {
                         self.log_fetch_failure(&failure);
@@ -1186,7 +1353,7 @@ where
                         && let Some(settings) = self.reload_settings(config.as_ref(), &adaptor)
                     {
                         target_changed = self.settings.target != settings.target;
-                        self.apply_settings(settings, &mut fetch_interval, &mut http_req_tx, &mut http_resp_rx, &mut http_task, &mut tcp_worker);
+                        apply_settings!(settings);
                     }
                     if let Some(failure) = control_failure {
                         self.log_fetch_failure(&failure);
@@ -1337,14 +1504,7 @@ where
                             }
 
                             if let Some(settings) = self.reload_settings(config.as_ref(), &adaptor) {
-                                self.apply_settings(
-                                    settings,
-                                    &mut fetch_interval,
-                                    &mut http_req_tx,
-                                    &mut http_resp_rx,
-                                    &mut http_task,
-                                    &mut tcp_worker,
-                                );
+                                apply_settings!(settings);
                             }
                         },
                         InternalMsg::Service(table) => {
@@ -1363,6 +1523,10 @@ where
                             }
                             if let Some(task) = tcp_worker.task.take() {
                                 task.abort();
+                            }
+                            #[cfg(feature = "mqtt")]
+                            if let Some(worker) = mqtt_worker.take() {
+                                worker.close(self.settings.timeout).await;
                             }
                             adaptor.terminate();
                             self.proc.remove_proc(None).await?;
