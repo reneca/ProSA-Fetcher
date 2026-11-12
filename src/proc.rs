@@ -683,6 +683,17 @@ impl FetcherProc {
         }
     }
 
+    /// Non-2xx HTTP response the adaptor handled by chaining another network request
+    /// (e.g. an authentication challenge). Only the final response of the chain is reported.
+    fn is_intermediate_http_response(
+        http_status: Option<StatusCode>,
+        processed: &ProcessedFetchAction<M>,
+    ) -> bool {
+        http_status.is_some_and(|status| !status.is_success())
+            && !processed.timed_out
+            && matches!(processed.action, Ok(FetchAction::Http | FetchAction::Tcp))
+    }
+
     fn status_metric_attributes(&self) -> Vec<KeyValue> {
         let mut attributes = vec![KeyValue::new("processor", self.name().to_string())];
         if let Some(target) = &self.settings.target {
@@ -1196,11 +1207,15 @@ where
                         processing_failure.as_ref().map(|failure| failure.status_code),
                         processed.timed_out,
                     );
-                    self.record_status_code(
-                        &status_gauge,
-                        &mut last_status_code,
-                        status_code,
-                    );
+                    let intermediate_response =
+                        Self::is_intermediate_http_response(http_status, &processed);
+                    if !intermediate_response {
+                        self.record_status_code(
+                            &status_gauge,
+                            &mut last_status_code,
+                            status_code,
+                        );
+                    }
 
                     if Self::status_is_success(status_code) {
                         let mut attributes = vec![KeyValue::new("type", "http")];
@@ -1251,7 +1266,15 @@ where
                         continue;
                     }
                     if let Some(failure) = response_failure {
-                        self.log_fetch_failure(&failure);
+                        if intermediate_response && !target_changed {
+                            debug!(
+                                processor = self.name(),
+                                status_code = failure.status_code,
+                                "HTTP response handled by the adaptor with a follow-up request"
+                            );
+                        } else {
+                            self.log_fetch_failure(&failure);
+                        }
                     }
                     let Some(action) = action else {
                         continue;
@@ -1680,6 +1703,53 @@ mod tests {
         }
     }
 
+    static CHALLENGE_STATUSES: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+
+    /// Answers a 401 challenge with an immediate authenticated follow-up request.
+    struct ChallengeAdaptor;
+
+    impl Adaptor for ChallengeAdaptor {
+        fn terminate(&self) {}
+    }
+
+    impl FetcherAdaptor<SimpleStringTvf> for ChallengeAdaptor {
+        fn new(
+            _proc: &FetcherProc<SimpleStringTvf>,
+        ) -> Result<Self, FetcherError<SimpleStringTvf>> {
+            Ok(Self)
+        }
+
+        fn fetch(&mut self) -> Result<FetchAction<SimpleStringTvf>, FetcherError<SimpleStringTvf>> {
+            Ok(FetchAction::Http)
+        }
+
+        fn create_http_request(
+            &self,
+            request_builder: http::request::Builder,
+        ) -> Result<Request<BoxBody<Bytes, Infallible>>, FetcherError<SimpleStringTvf>> {
+            Ok(request_builder
+                .method(http::Method::GET)
+                .uri("/")
+                .body(Empty::<Bytes>::new().boxed())?)
+        }
+
+        async fn process_http_response(
+            &mut self,
+            response: Result<Response<Incoming>, FetcherError<SimpleStringTvf>>,
+        ) -> Result<FetchAction<SimpleStringTvf>, FetcherError<SimpleStringTvf>> {
+            let status = response?.status();
+            CHALLENGE_STATUSES
+                .lock()
+                .expect("challenge statuses lock should not be poisoned")
+                .push(status.as_u16());
+            if status == StatusCode::UNAUTHORIZED {
+                Ok(FetchAction::Http)
+            } else {
+                Ok(FetchAction::None)
+            }
+        }
+    }
+
     fn request() -> Request<BoxBody<Bytes, Infallible>> {
         Request::builder()
             .uri("/")
@@ -1891,6 +1961,148 @@ mod tests {
         })
         .await
         .expect("fetcher should recover before the test deadline");
+    }
+
+    #[tokio::test]
+    async fn reports_only_unhandled_http_error_responses() {
+        time::timeout(Duration::from_secs(1), async {
+            let processed =
+                |action, timed_out| ProcessedFetchAction::<SimpleStringTvf> { action, timed_out };
+            let is_intermediate = FetcherProc::<SimpleStringTvf>::is_intermediate_http_response;
+
+            assert!(is_intermediate(
+                Some(StatusCode::UNAUTHORIZED),
+                &processed(Ok(FetchAction::Http), false)
+            ));
+            assert!(is_intermediate(
+                Some(StatusCode::UNAUTHORIZED),
+                &processed(Ok(FetchAction::Tcp), false)
+            ));
+            assert!(!is_intermediate(
+                Some(StatusCode::UNAUTHORIZED),
+                &processed(Ok(FetchAction::None), false)
+            ));
+            assert!(!is_intermediate(
+                Some(StatusCode::UNAUTHORIZED),
+                &processed(Err(FetcherError::Other("adaptor failure".into())), false)
+            ));
+            assert!(!is_intermediate(
+                Some(StatusCode::UNAUTHORIZED),
+                &processed(Ok(FetchAction::Http), true)
+            ));
+            assert!(!is_intermediate(
+                Some(StatusCode::OK),
+                &processed(Ok(FetchAction::Http), false)
+            ));
+            assert!(!is_intermediate(
+                None,
+                &processed(Ok(FetchAction::Http), false)
+            ));
+        })
+        .await
+        .expect("status classification should not block");
+    }
+
+    #[tokio::test]
+    async fn chains_follow_up_request_after_handled_http_error() {
+        time::timeout(Duration::from_secs(2), async {
+            CHALLENGE_STATUSES
+                .lock()
+                .expect("challenge statuses lock should not be poisoned")
+                .clear();
+
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("test listener should bind");
+            let addr = listener
+                .local_addr()
+                .expect("test listener should have an address");
+            let server = tokio::spawn(async move {
+                // The HTTP worker keeps the connection open across requests.
+                let (mut stream, _) = listener
+                    .accept()
+                    .await
+                    .expect("test listener should accept a request");
+                for response in [
+                    &b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"test\"\r\nContent-Length: 0\r\n\r\n"[..],
+                    &b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"[..],
+                ] {
+                    let mut request = Vec::new();
+                    let mut buffer = [0; 1024];
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        let read = stream
+                            .read(&mut buffer)
+                            .await
+                            .expect("test server should read the request");
+                        assert_ne!(0, read, "fetcher closed the connection before the request");
+                        request.extend_from_slice(&buffer[..read]);
+                    }
+                    stream
+                        .write_all(response)
+                        .await
+                        .expect("test server should write the response");
+                }
+            });
+
+            let fetcher_settings = FetcherSettings::new(
+                TargetSetting::from(
+                    Url::parse(&format!("http://{addr}")).expect("test URL should be valid"),
+                ),
+                String::new(),
+                false,
+                Duration::from_secs(10),
+                Duration::from_millis(500),
+            );
+            let runtime_settings = RuntimeTestSettings::default();
+            let (bus, main) = MainProc::<SimpleStringTvf>::create(&runtime_settings, Some(1));
+            let main_task = tokio::spawn(main.run());
+            let mut processor = FetcherProc::<SimpleStringTvf>::create(
+                1,
+                "CHALLENGE_FETCHER".into(),
+                bus.clone(),
+                fetcher_settings,
+            );
+            let processor_task = tokio::spawn(async move {
+                <FetcherProc<SimpleStringTvf> as Proc<ChallengeAdaptor>>::internal_run(
+                    &mut processor,
+                )
+                .await
+            });
+
+            // The period is far longer than the test deadline, so the 200 can only come from
+            // the follow-up dispatched right after the 401, not from a later tick.
+            server.await.expect("test server should join");
+            while CHALLENGE_STATUSES
+                .lock()
+                .expect("challenge statuses lock should not be poisoned")
+                .len()
+                < 2
+            {
+                assert!(
+                    !processor_task.is_finished(),
+                    "processor stopped before the follow-up response"
+                );
+                time::sleep(Duration::from_millis(5)).await;
+            }
+            assert_eq!(
+                vec![401, 200],
+                *CHALLENGE_STATUSES
+                    .lock()
+                    .expect("challenge statuses lock should not be poisoned")
+            );
+
+            bus.stop("fetcher challenge test complete".into())
+                .await
+                .expect("main bus should stop");
+            let processor_result = processor_task.await.expect("processor task should join");
+            assert!(
+                processor_result.is_ok() || bus.is_stopping(),
+                "processor should only stop after the main bus shuts down: {processor_result:?}"
+            );
+            main_task.await.expect("main task should join");
+        })
+        .await
+        .expect("follow-up request should complete before the test deadline");
     }
 
     #[tokio::test]

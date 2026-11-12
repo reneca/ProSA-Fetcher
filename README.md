@@ -86,7 +86,10 @@ worker-channel failures remain fatal.
 The fetcher exports two metrics:
 
 - `prosa_fetcher_status_code` is a gauge containing the latest
-  HTTP-compatible result code. HTTP responses keep their exact status. Other
+  HTTP-compatible result code. HTTP responses keep their exact status. A non-2xx
+  HTTP response that the adaptor answers with a follow-up HTTP or TCP request
+  (e.g. an authentication challenge) is neither recorded nor logged as a
+  failure. Other
   transports use `200` for success, `400` for invalid input, `401` for invalid
   credentials, `403` for permission failures, `502` for protocol or broken
   connection failures, `503` for unavailable targets or services, `504` for
